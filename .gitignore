@@ -1,3 +1,5 @@
 build/
 site/
 .pio/
+web/firmware/
+tools/esptool/

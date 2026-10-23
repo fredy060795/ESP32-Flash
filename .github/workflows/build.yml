@@ -52,6 +52,23 @@ jobs:
           name: esp32cam_ble-firmware
           path: site/firmware/esp32cam_ble.bin
 
+      - name: Windows-Paket mit start.bat zusammenstellen
+        run: |
+          PKG=package/Helm-Camera-Flasher
+          mkdir -p $PKG/tools/esptool
+          cp start.bat $PKG/
+          cp tools/server.ps1 $PKG/tools/
+          cp -r site $PKG/web
+          curl -sSL -o esptool.zip https://github.com/espressif/esptool/releases/download/v4.8.1/esptool-v4.8.1-win64.zip
+          unzip -q esptool.zip -d esptool-extract
+          cp -r esptool-extract/esptool-win64/* $PKG/tools/esptool/
+          find package -type f | sort
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Helm-Camera-Flasher-Windows
+          path: package
+
       - uses: actions/upload-pages-artifact@v3
         if: github.ref == 'refs/heads/main'
         with:

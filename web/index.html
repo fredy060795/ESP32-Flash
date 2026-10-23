@@ -10,18 +10,23 @@
 <main>
   <h1>Helm Camera Flasher</h1>
   <p class="lead">Firmware für die ESP32-CAM (OV2640) als Bluetooth-Helmkamera.
-    Board anstecken, Namen eingeben, „Flashen“ klicken – keine Software nötig.</p>
+    Board anstecken, COM-Port und Namen wählen, „Flashen“ klicken.</p>
 
-  <p id="unsupported" class="card warn hidden">Dieser Browser kann nicht flashen.
-    Bitte <b>Chrome</b> oder <b>Edge</b> am PC/Mac verwenden.</p>
+  <p id="unsupported" class="card warn hidden">Dieser Browser kann nicht direkt flashen.
+    Bitte <b>start.bat</b> verwenden oder die Seite in <b>Chrome</b> bzw. <b>Edge</b> öffnen.</p>
 
   <section class="card">
-    <h2>Kamera flashen</h2>
+    <h2>Kamera flashen <span class="badge" id="mode"></span></h2>
     <ol>
       <li>Kamera auf das USB-C-Board (ESP32-CAM-MB) stecken und per USB-Kabel an den PC anschließen.</li>
-      <li>Bluetooth-Namen der Kamera eingeben (so erscheint sie später auf dem Handy).</li>
-      <li>Auf <b>Flashen</b> klicken und den Port wählen (meist „USB-SERIAL CH340“).</li>
+      <li>COM-Port der Kamera wählen (meist „USB-SERIAL CH340“).</li>
+      <li>Bluetooth-Namen eingeben (so erscheint die Kamera später auf dem Handy) und <b>Flashen</b> klicken.</li>
     </ol>
+    <label for="port">COM-Port</label>
+    <div class="row">
+      <select id="port"></select>
+      <button id="refresh" title="Liste neu laden">Aktualisieren</button>
+    </div>
     <label for="name">Name der Kamera (max. 29 Zeichen)</label>
     <input id="name" value="Helm Camera" maxlength="29" autocomplete="off">
     <label class="check"><input type="checkbox" id="erase" checked> Kamera vorher komplett löschen (empfohlen)</label>
@@ -36,10 +41,13 @@
       <pre id="log"></pre>
     </details>
     <details>
-      <summary>Kein Port zu sehen / Verbindung klappt nicht?</summary>
+      <summary>Kein COM-Port zu sehen / Verbindung klappt nicht?</summary>
       <ul>
         <li>Windows braucht den <b>CH340-Treiber</b> (einmalig installieren, dann Board neu anstecken).</li>
         <li>Ein Kabel verwenden, das Daten überträgt – reine Ladekabel funktionieren nicht.</li>
+        <li>Welcher Port der richtige ist: Board abziehen, „Aktualisieren“, wieder anstecken, „Aktualisieren“ –
+          der neue Eintrag ist die Kamera.</li>
+        <li>Andere Programme schließen, die den Port benutzen (z. B. Arduino IDE).</li>
         <li><b>IO0</b>-Knopf am USB-Board gedrückt halten, kurz <b>RST</b> drücken,
           IO0 loslassen und erneut auf Flashen klicken.</li>
       </ul>
@@ -55,22 +63,25 @@
   </section>
 </main>
 <script type="module">
-import { ESPLoader, Transport } from 'https://unpkg.com/esptool-js@0.6.1/bundle.js';
-
 const FIRMWARE_URL = 'firmware/esp32cam_ble.bin';
+const ESPTOOL_JS = 'https://unpkg.com/esptool-js@0.6.1/bundle.js';
 const NAME_MAX_BYTES = 29;
+const NEW_PORT = '__new__';
+const USB_CHIPS = { 0x1a86: 'CH340', 0x10c4: 'CP210x', 0x0403: 'FTDI', 0x303a: 'ESP32 USB' };
+
 const $ = id => document.getElementById(id);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+let local = false;      // true = über start.bat (lokaler Server mit esptool)
+let grantedPorts = [];  // Web Serial: freigegebene Ports
 let busy = false;
 
-if (!('serial' in navigator)) {
-  $('unsupported').classList.remove('hidden');
-  $('flash').disabled = $('rename').disabled = true;
-}
-
 const log = text => { $('log').textContent += text; $('log').scrollTop = 1e9; };
-const terminal = { clean() {}, writeLine: t => log(t + '\n'), write: t => log(t) };
 const setState = (text, cls = '') => { $('state').textContent = text; $('state').className = 'state ' + cls; };
+const setBusy = b => {
+  busy = b;
+  for (const id of ['flash', 'rename', 'refresh', 'port']) $(id).disabled = b;
+  if (!b) $('progress').classList.add('hidden');
+};
 
 function checkName() {
   const name = $('name').value.trim();
@@ -80,6 +91,105 @@ function checkName() {
     return null;
   }
   return name;
+}
+
+function fillPorts(items, keep) {
+  const sel = $('port');
+  const prev = keep ? sel.value : null;
+  sel.innerHTML = '';
+  for (const { value, label } of items) {
+    const o = document.createElement('option');
+    o.value = value;
+    o.textContent = label;
+    sel.appendChild(o);
+  }
+  if (prev && items.some(i => i.value === prev)) sel.value = prev;
+}
+
+// ======================================================================
+// Lokal (start.bat): COM-Ports und Flashen über den PowerShell-Server
+// ======================================================================
+
+async function refreshLocalPorts() {
+  const ports = await (await fetch('/api/ports', { cache: 'no-store' })).json();
+  if (!ports.length) {
+    fillPorts([{ value: '', label: 'Kein COM-Port gefunden – Board anstecken und „Aktualisieren“' }]);
+  } else {
+    fillPorts(ports.map(p => ({ value: p.port, label: p.name.includes(p.port) ? p.name : p.port + ' – ' + p.name })), true);
+  }
+}
+
+async function runLocal(withFlash, name) {
+  const port = $('port').value;
+  if (!port) return setState('Bitte zuerst einen COM-Port wählen.', 'err');
+  const resp = await fetch(withFlash ? '/api/flash' : '/api/rename', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ port, name, erase: $('erase').checked }),
+  });
+  const res = await resp.json();
+  if (!res.ok) throw new Error(res.error);
+
+  const bar = $('progress');
+  let step = withFlash ? 'Verbinde mit der Kamera' : 'Name wird gesetzt';
+  setState(step + ' …');
+  while (true) {
+    await sleep(500);
+    const st = await (await fetch('/api/status', { cache: 'no-store' })).json();
+    $('log').textContent = st.log;
+    $('log').scrollTop = 1e9;
+    const steps = [...st.log.matchAll(/^STEP (.+)$/gm)];
+    if (steps.length) step = steps[steps.length - 1][1];
+    const pct = [...st.log.matchAll(/\((\d+) ?%\)/g)];
+    if (step === 'Flashen' && pct.length) {
+      bar.classList.remove('hidden');
+      bar.value = +pct[pct.length - 1][1];
+      setState('Flashen … ' + bar.value + ' %');
+    } else {
+      setState(step + ' …');
+    }
+    const result = st.log.match(/^RESULT (OK|ERR ?(.*))$/m);
+    if (result) {
+      if (result[1] === 'OK') return true;
+      throw new Error(result[2] || 'Unbekannter Fehler');
+    }
+    if (!st.running) throw new Error('Vorgang unerwartet beendet');
+  }
+}
+
+// ======================================================================
+// Browser (GitHub Pages): Web Serial + esptool-js
+// ======================================================================
+
+function portLabel(port, i) {
+  const info = port.getInfo();
+  const chip = USB_CHIPS[info.usbVendorId] || 'USB-Seriell';
+  const id = info.usbVendorId !== undefined
+    ? ' – USB ' + info.usbVendorId.toString(16).toUpperCase().padStart(4, '0') + ':' + info.usbProductId.toString(16).toUpperCase().padStart(4, '0')
+    : '';
+  return 'Port ' + (i + 1) + ': ' + chip + id;
+}
+
+async function refreshBrowserPorts(selectPort) {
+  grantedPorts = await navigator.serial.getPorts();
+  const items = grantedPorts.map((p, i) => ({ value: String(i), label: portLabel(p, i) }));
+  items.push({ value: NEW_PORT, label: grantedPorts.length ? 'Anderen COM-Port auswählen …' : 'COM-Port auswählen …' });
+  fillPorts(items, !selectPort);
+  if (selectPort) {
+    const i = grantedPorts.indexOf(selectPort);
+    if (i >= 0) $('port').value = String(i);
+  }
+}
+
+async function pickBrowserPort() {
+  try {
+    const port = await navigator.serial.requestPort();
+    await refreshBrowserPorts(port);
+    return port;
+  } catch (e) {
+    await refreshBrowserPorts();
+    return null; // Auswahl abgebrochen
+  }
 }
 
 // Setzt den Namen über die serielle Schnittstelle. Die Firmware antwortet mit
@@ -128,27 +238,19 @@ async function sendName(port, name, resetFirst) {
   }
 }
 
-async function run(withFlash) {
-  if (busy) return;
-  const name = checkName();
-  if (!name) return;
-  let port;
-  try {
-    port = await navigator.serial.requestPort();
-  } catch (e) {
-    return; // Auswahl abgebrochen
-  }
-  busy = true;
-  $('flash').disabled = $('rename').disabled = true;
-  $('log').textContent = '';
+async function runBrowser(withFlash, name) {
+  let port = $('port').value === NEW_PORT ? await pickBrowserPort() : grantedPorts[+$('port').value];
+  if (!port) return setState('Bitte zuerst einen COM-Port wählen.', 'err');
   try {
     if (withFlash) {
-      setState('Firmware wird geladen …');
+      setState('Flasher wird geladen …');
+      const { ESPLoader, Transport } = await import(ESPTOOL_JS);
       const resp = await fetch(FIRMWARE_URL, { cache: 'no-store' });
       if (!resp.ok) throw new Error('Firmware nicht gefunden (' + resp.status + ')');
       const data = new Uint8Array(await resp.arrayBuffer());
 
       setState('Verbinde mit der Kamera …');
+      const terminal = { clean() {}, writeLine: t => log(t + '\n'), write: t => log(t) };
       const transport = new Transport(port, false);
       const loader = new ESPLoader({ transport, baudrate: 460800, terminal });
       const chip = await loader.main();
@@ -174,28 +276,72 @@ async function run(withFlash) {
       await transport.disconnect();
       await sleep(500);
     }
-
-    setState('Name „' + name + '“ wird gesetzt …');
-    const ok = await sendName(port, name, !withFlash);
-    if (ok) {
-      setState('Fertig! Die Kamera heißt jetzt „' + name + '“. Board abziehen und benutzen.', 'ok');
-    } else {
-      setState('Name konnte nicht gesetzt werden. RST an der Kamera drücken und „Nur Namen ändern“ versuchen.', 'err');
+    setState('Name wird gesetzt …');
+    if (!(await sendName(port, name, !withFlash))) {
+      throw new Error('Name konnte nicht gesetzt werden. RST an der Kamera drücken und „Nur Namen ändern“ versuchen.');
     }
+    return true;
+  } catch (e) {
+    try { await port.close(); } catch (_) {}
+    throw e;
+  }
+}
+
+// ======================================================================
+
+async function run(withFlash) {
+  if (busy) return;
+  const name = checkName();
+  if (!name) return;
+  setBusy(true);
+  $('log').textContent = '';
+  try {
+    await (local ? runLocal(withFlash, name) : runBrowser(withFlash, name));
+    if ($('state').classList.contains('err')) return;
+    setState('Fertig! Die Kamera heißt jetzt „' + name + '“. Board abziehen und benutzen.', 'ok');
   } catch (e) {
     console.error(e);
-    log('\n' + e + '\n');
-    setState('Fehler: ' + (e.message || e) + ' – siehe „Kein Port zu sehen“ unten.', 'err');
-    try { await port.close(); } catch (_) {}
+    log('\n' + (e.message || e) + '\n');
+    setState('Fehler: ' + (e.message || e), 'err');
   } finally {
-    busy = false;
-    $('flash').disabled = $('rename').disabled = false;
-    $('progress').classList.add('hidden');
+    setBusy(false);
   }
+}
+
+async function refresh() {
+  try {
+    if (local) await refreshLocalPorts();
+    else if ('serial' in navigator) await refreshBrowserPorts();
+  } catch (e) {
+    setState('Port-Liste konnte nicht geladen werden: ' + e.message, 'err');
+  }
+}
+
+async function init() {
+  try {
+    const r = await fetch('/api/ports', { cache: 'no-store' });
+    local = r.ok && (r.headers.get('content-type') || '').includes('json');
+  } catch (e) { local = false; }
+
+  $('mode').textContent = local ? 'lokal (start.bat)' : 'Browser';
+  if (!local && !('serial' in navigator)) {
+    $('unsupported').classList.remove('hidden');
+    setBusy(true);
+    fillPorts([{ value: '', label: 'Nicht verfügbar' }]);
+    return;
+  }
+  if (!local) {
+    navigator.serial.addEventListener('connect', () => refresh());
+    navigator.serial.addEventListener('disconnect', () => refresh());
+    $('port').addEventListener('change', () => { if ($('port').value === NEW_PORT) pickBrowserPort(); });
+  }
+  await refresh();
 }
 
 $('flash').onclick = () => run(true);
 $('rename').onclick = () => run(false);
+$('refresh').onclick = () => refresh();
+init();
 </script>
 </body>
 </html>
