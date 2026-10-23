@@ -1,25 +1,24 @@
-// ESP32-CAM (AI-Thinker / ARCELI, OV2640)
+// ESP32-CAM Helmkamera (AI-Thinker / ARCELI, OV2640) – nur Bluetooth Low Energy
 //
-// - Eigener WLAN-Hotspot (immer an): Handy verbindet sich direkt mit der Kamera,
-//   kein Router nötig. Live-Bild unter http://192.168.4.1
-// - Optional zusätzlich Heim-WLAN (per Bluetooth einstellbar)
-// - Bluetooth Low Energy: Status lesen (inkl. Hotspot-Passwort), WLAN einstellen,
-//   Blitz-LED, Auflösung, Einzelbilder direkt über Bluetooth übertragen
+// - Kein WLAN: Das Handy bleibt im normalen Internet und holt die Bilder per BLE ab.
+// - Keine Passwörter, kein Pairing: BLE ist ab dem Start aktiv.
+// - Gerätename (Standard "Helm Camera") wird beim Flashen über USB gesetzt
+//   (Befehl "NAME=..." über die serielle Schnittstelle) oder per BLE-Befehl.
+// - Bilder als JPEG, einzeln ("snap") oder fortlaufend ("stream").
 //
-// Alle Einstellungen bleiben im Flash gespeichert (Preferences / NVS).
+// Protokoll: siehe ../../PROTOCOL.md
 
 #include <Arduino.h>
-#include <WiFi.h>
 #include <Preferences.h>
 #include <NimBLEDevice.h>
 #include <ArduinoJson.h>
 #include "esp_camera.h"
-#include "esp_http_server.h"
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
-#include "web_page.h"
 
-#define FW_VERSION "1.0.0"
+#define FW_VERSION "2.0.0"
+#define DEFAULT_NAME "Helm Camera"
+#define NAME_MAX_BYTES 29  // passt in die BLE-Scan-Antwort
 
 // ---------- AI-Thinker ESP32-CAM Pinbelegung ----------
 #define PWDN_GPIO_NUM 32
@@ -41,36 +40,33 @@
 #define FLASH_LED_PIN 4
 #define STATUS_LED_PIN 33  // rote LED auf der Rückseite, active low
 
-// ---------- Bluetooth UUIDs (müssen zu web/app.html passen) ----------
+// ---------- Bluetooth UUIDs (siehe PROTOCOL.md) ----------
 #define SERVICE_UUID "7b3c0001-6b1a-4d6e-9c55-3a2f1e0c8a01"
 #define STATUS_UUID "7b3c0002-6b1a-4d6e-9c55-3a2f1e0c8a01"
 #define COMMAND_UUID "7b3c0003-6b1a-4d6e-9c55-3a2f1e0c8a01"
 #define IMAGE_UUID "7b3c0004-6b1a-4d6e-9c55-3a2f1e0c8a01"
 
 // Bildübertragung per BLE-Notification, jedes Paket beginnt mit einem Typ-Byte:
-//   0x01 Start: u32 Länge, u16 Breite, u16 Höhe (little endian)
+//   0x01 Start: u32 Länge, u16 Breite, u16 Höhe, u32 Bildnummer (little endian)
 //   0x02 Daten: u32 Offset, danach JPEG-Bytes
-//   0x03 Ende
+//   0x03 Ende:  u32 Bildnummer
 //   0x04 Fehler: Text
 enum : uint8_t { IMG_START = 1, IMG_DATA = 2, IMG_END = 3, IMG_ERROR = 4 };
 
 struct Settings {
   String name;
-  String apSsid;
-  String apPass;
-  String staSsid;
-  String staPass;
   int framesize;
   int quality;
+  int interval;  // Mindestabstand zwischen Bildern im Stream-Modus (ms)
 };
 
 static Settings cfg;
 static Preferences prefs;
 static bool cameraOk = false;
 static int flashLevel = 0;
-
-static httpd_handle_t webServer = nullptr;
-static httpd_handle_t streamServer = nullptr;
+static bool streaming = false;
+static uint32_t frameNo = 0;
+static uint32_t lastFrameAt = 0;
 
 static NimBLEServer* bleServer = nullptr;
 static NimBLECharacteristic* statusChr = nullptr;
@@ -79,50 +75,43 @@ static volatile uint16_t bleConn = BLE_HS_CONN_HANDLE_NONE;
 static QueueHandle_t cmdQueue = nullptr;
 static const size_t CMD_MAX = 256;
 
-static volatile bool wifiRestart = false;
 static volatile bool statusDirty = false;
+static volatile bool stopStream = false;
 static uint32_t rebootAt = 0;
 
 // ======================================================================
 // Einstellungen
 // ======================================================================
 
-static String chipSuffix() {
-  uint8_t mac[6];
-  WiFi.macAddress(mac);
-  char buf[5];
-  snprintf(buf, sizeof(buf), "%02X%02X", mac[4], mac[5]);
-  return String(buf);
-}
-
 static void loadSettings() {
   prefs.begin("cam", true);
-  String def = "ESP32-CAM-" + chipSuffix();
-  cfg.name = prefs.getString("name", def);
-  cfg.apSsid = prefs.getString("apSsid", def);
-  cfg.apPass = prefs.getString("apPass", "kamera123");
-  cfg.staSsid = prefs.getString("staSsid", "");
-  cfg.staPass = prefs.getString("staPass", "");
-  cfg.framesize = prefs.getInt("fs", FRAMESIZE_VGA);
+  cfg.name = prefs.getString("name", DEFAULT_NAME);
+  cfg.framesize = prefs.getInt("fs", FRAMESIZE_QVGA);
   cfg.quality = prefs.getInt("q", 12);
+  cfg.interval = prefs.getInt("iv", 0);
   prefs.end();
 }
 
 static void saveSettings() {
   prefs.begin("cam", false);
   prefs.putString("name", cfg.name);
-  prefs.putString("apSsid", cfg.apSsid);
-  prefs.putString("apPass", cfg.apPass);
-  prefs.putString("staSsid", cfg.staSsid);
-  prefs.putString("staPass", cfg.staPass);
   prefs.putInt("fs", cfg.framesize);
   prefs.putInt("q", cfg.quality);
+  prefs.putInt("iv", cfg.interval);
   prefs.end();
+}
+
+static bool validName(const String& n) {
+  return n.length() > 0 && n.length() <= NAME_MAX_BYTES;
 }
 
 // ======================================================================
 // Kamera
 // ======================================================================
+
+static int maxFramesize() {
+  return psramFound() ? (int)FRAMESIZE_UXGA : (int)FRAMESIZE_SVGA;
+}
 
 static bool initCamera() {
   camera_config_t c = {};
@@ -166,8 +155,8 @@ static bool initCamera() {
     Serial.printf("Kamera-Fehler 0x%x\n", err);
     return false;
   }
+  cfg.framesize = constrain(cfg.framesize, 0, maxFramesize());
   sensor_t* s = esp_camera_sensor_get();
-  if (!psramFound() && cfg.framesize > FRAMESIZE_SVGA) cfg.framesize = FRAMESIZE_SVGA;
   s->set_framesize(s, (framesize_t)cfg.framesize);
   s->set_quality(s, cfg.quality);
   return true;
@@ -186,30 +175,7 @@ static void setFlash(int level) {
 }
 
 // ======================================================================
-// WLAN
-// ======================================================================
-
-static void startWifi() {
-  WiFi.persistent(false);
-  WiFi.disconnect(true);
-  WiFi.softAPdisconnect(true);
-  delay(100);
-
-  bool useSta = cfg.staSsid.length() > 0;
-  WiFi.mode(useSta ? WIFI_AP_STA : WIFI_AP);
-  WiFi.softAP(cfg.apSsid.c_str(), cfg.apPass.length() >= 8 ? cfg.apPass.c_str() : nullptr);
-  WiFi.setSleep(false);
-  if (useSta) {
-    WiFi.setHostname(cfg.name.c_str());
-    WiFi.setAutoReconnect(true);
-    WiFi.begin(cfg.staSsid.c_str(), cfg.staPass.c_str());
-  }
-  Serial.printf("Hotspot: %s  Passwort: %s  IP: %s\n", cfg.apSsid.c_str(), cfg.apPass.c_str(),
-                WiFi.softAPIP().toString().c_str());
-}
-
-// ======================================================================
-// Status (JSON) – über Bluetooth und /status abrufbar
+// Status (JSON)
 // ======================================================================
 
 static String statusJson() {
@@ -217,16 +183,10 @@ static String statusJson() {
   d["name"] = cfg.name;
   d["fw"] = FW_VERSION;
   d["camera"] = cameraOk;
-  d["ap_ssid"] = cfg.apSsid;
-  d["ap_pass"] = cfg.apPass;
-  d["ap_ip"] = WiFi.softAPIP().toString();
-  d["ap_clients"] = WiFi.softAPgetStationNum();
-  d["sta_ssid"] = cfg.staSsid;
-  bool staUp = WiFi.status() == WL_CONNECTED;
-  d["sta_connected"] = staUp;
-  d["sta_ip"] = staUp ? WiFi.localIP().toString() : String("");
   d["framesize"] = cfg.framesize;
   d["quality"] = cfg.quality;
+  d["interval"] = cfg.interval;
+  d["streaming"] = streaming;
   d["flash"] = flashLevel;
   d["uptime"] = millis() / 1000;
   String out;
@@ -244,116 +204,6 @@ static void publishStatus() {
 }
 
 // ======================================================================
-// Webserver
-// ======================================================================
-
-#define PART_BOUNDARY "123456789000000000000987654321"
-static const char* STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
-static const char* STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
-static const char* STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
-
-static esp_err_t indexHandler(httpd_req_t* req) {
-  httpd_resp_set_type(req, "text/html");
-  return httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
-}
-
-static esp_err_t statusHandler(httpd_req_t* req) {
-  String s = statusJson();
-  httpd_resp_set_type(req, "application/json");
-  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-  return httpd_resp_send(req, s.c_str(), s.length());
-}
-
-static esp_err_t captureHandler(httpd_req_t* req) {
-  camera_fb_t* fb = esp_camera_fb_get();
-  if (!fb) {
-    httpd_resp_send_500(req);
-    return ESP_FAIL;
-  }
-  httpd_resp_set_type(req, "image/jpeg");
-  httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=foto.jpg");
-  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-  esp_err_t res = httpd_resp_send(req, (const char*)fb->buf, fb->len);
-  esp_camera_fb_return(fb);
-  return res;
-}
-
-static esp_err_t controlHandler(httpd_req_t* req) {
-  char query[96], var[32], val[32];
-  if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
-      httpd_query_key_value(query, "var", var, sizeof(var)) != ESP_OK ||
-      httpd_query_key_value(query, "val", val, sizeof(val)) != ESP_OK) {
-    httpd_resp_send_404(req);
-    return ESP_FAIL;
-  }
-  int v = atoi(val);
-  if (!strcmp(var, "framesize")) {
-    cfg.framesize = constrain(v, 0, psramFound() ? (int)FRAMESIZE_UXGA : (int)FRAMESIZE_SVGA);
-    applyCameraSettings();
-    saveSettings();
-  } else if (!strcmp(var, "quality")) {
-    cfg.quality = constrain(v, 4, 63);
-    applyCameraSettings();
-    saveSettings();
-  } else if (!strcmp(var, "flash")) {
-    setFlash(v);
-  } else {
-    httpd_resp_send_404(req);
-    return ESP_FAIL;
-  }
-  statusDirty = true;
-  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-  return httpd_resp_send(req, "OK", 2);
-}
-
-static esp_err_t streamHandler(httpd_req_t* req) {
-  char part[64];
-  esp_err_t res = httpd_resp_set_type(req, STREAM_CONTENT_TYPE);
-  if (res != ESP_OK) return res;
-  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-  while (true) {
-    camera_fb_t* fb = esp_camera_fb_get();
-    if (!fb) {
-      res = ESP_FAIL;
-      break;
-    }
-    size_t hlen = snprintf(part, sizeof(part), STREAM_PART, fb->len);
-    res = httpd_resp_send_chunk(req, STREAM_BOUNDARY, strlen(STREAM_BOUNDARY));
-    if (res == ESP_OK) res = httpd_resp_send_chunk(req, part, hlen);
-    if (res == ESP_OK) res = httpd_resp_send_chunk(req, (const char*)fb->buf, fb->len);
-    esp_camera_fb_return(fb);
-    if (res != ESP_OK) break;
-  }
-  return res;
-}
-
-static void startWebServer() {
-  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-  config.max_uri_handlers = 8;
-  config.server_port = 80;
-  config.ctrl_port = 32768;
-
-  httpd_uri_t index = {"/", HTTP_GET, indexHandler, nullptr};
-  httpd_uri_t status = {"/status", HTTP_GET, statusHandler, nullptr};
-  httpd_uri_t capture = {"/capture", HTTP_GET, captureHandler, nullptr};
-  httpd_uri_t control = {"/control", HTTP_GET, controlHandler, nullptr};
-  if (httpd_start(&webServer, &config) == ESP_OK) {
-    httpd_register_uri_handler(webServer, &index);
-    httpd_register_uri_handler(webServer, &status);
-    httpd_register_uri_handler(webServer, &capture);
-    httpd_register_uri_handler(webServer, &control);
-  }
-
-  // Stream läuft auf eigenem Port, damit die Steuerung parallel funktioniert
-  config.server_port = 81;
-  config.ctrl_port = 32769;
-  httpd_uri_t stream = {"/stream", HTTP_GET, streamHandler, nullptr};
-  if (httpd_start(&streamServer, &config) == ESP_OK) {
-    httpd_register_uri_handler(streamServer, &stream);
-  }
-}
-
-// ======================================================================
 // Bluetooth (BLE)
 // ======================================================================
 
@@ -366,6 +216,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
   }
   void onDisconnect(NimBLEServer* s, ble_gap_conn_desc* desc) override {
     bleConn = BLE_HS_CONN_HANDLE_NONE;
+    stopStream = true;
     NimBLEDevice::startAdvertising();
   }
 };
@@ -423,16 +274,16 @@ static void imageError(const char* msg) {
   imageNotify(buf, n + 1);
 }
 
-static void sendSnapshotBle() {
-  if (bleConn == BLE_HS_CONN_HANDLE_NONE) return;
+static bool sendFrame() {
+  if (bleConn == BLE_HS_CONN_HANDLE_NONE) return false;
   if (!cameraOk) {
     imageError("Kamera nicht gefunden");
-    return;
+    return false;
   }
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) {
     imageError("Bild fehlgeschlagen");
-    return;
+    return false;
   }
 
   uint16_t mtu = bleServer->getPeerMTU(bleConn);
@@ -440,14 +291,16 @@ static void sendSnapshotBle() {
   if (payload > 512) payload = 512;
   size_t chunk = payload - 5;                   // Typ + Offset
 
+  uint32_t no = ++frameNo;
   uint8_t buf[512];
   buf[0] = IMG_START;
   uint32_t len = fb->len;
-  memcpy(buf + 1, &len, 4);
   uint16_t w = fb->width, h = fb->height;
+  memcpy(buf + 1, &len, 4);
   memcpy(buf + 5, &w, 2);
   memcpy(buf + 7, &h, 2);
-  bool ok = imageNotify(buf, 9);
+  memcpy(buf + 9, &no, 4);
+  bool ok = imageNotify(buf, 13);
 
   for (uint32_t off = 0; ok && off < len; off += chunk) {
     size_t n = min((size_t)(len - off), chunk);
@@ -460,11 +313,19 @@ static void sendSnapshotBle() {
 
   if (ok) {
     buf[0] = IMG_END;
-    imageNotify(buf, 1);
+    memcpy(buf + 1, &no, 4);
+    ok = imageNotify(buf, 5);
   }
+  return ok;
 }
 
-// Befehle kommen als JSON, z.B. {"cmd":"wifi","ssid":"Heim","pass":"geheim"}
+static void setName(const String& n) {
+  cfg.name = n;
+  saveSettings();
+  rebootAt = millis() + 500;  // BLE-Name wird beim Neustart übernommen
+}
+
+// Befehle kommen als JSON, z.B. {"cmd":"stream","on":true}
 static void handleCommand(const char* text) {
   JsonDocument d;
   if (deserializeJson(d, text)) {
@@ -475,25 +336,16 @@ static void handleCommand(const char* text) {
   Serial.printf("BLE-Befehl: %s\n", cmd);
 
   if (!strcmp(cmd, "snap")) {
-    sendSnapshotBle();
+    sendFrame();
     return;
-  } else if (!strcmp(cmd, "wifi")) {
-    cfg.staSsid = d["ssid"] | "";
-    cfg.staPass = d["pass"] | "";
-    saveSettings();
-    wifiRestart = true;
-  } else if (!strcmp(cmd, "ap")) {
-    String ssid = d["ssid"] | cfg.apSsid;
-    String pass = d["pass"] | cfg.apPass;
-    if (ssid.length() > 0 && ssid.length() <= 32 && (pass.length() == 0 || pass.length() >= 8)) {
-      cfg.apSsid = ssid;
-      cfg.apPass = pass;
+  } else if (!strcmp(cmd, "stream")) {
+    streaming = d["on"] | true;
+    if (!d["interval"].isNull()) {
+      cfg.interval = constrain(d["interval"] | 0, 0, 60000);
       saveSettings();
-      wifiRestart = true;
     }
   } else if (!strcmp(cmd, "cam")) {
-    cfg.framesize = constrain(d["framesize"] | cfg.framesize, 0,
-                              psramFound() ? (int)FRAMESIZE_UXGA : (int)FRAMESIZE_SVGA);
+    cfg.framesize = constrain(d["framesize"] | cfg.framesize, 0, maxFramesize());
     cfg.quality = constrain(d["quality"] | cfg.quality, 4, 63);
     applyCameraSettings();
     saveSettings();
@@ -501,11 +353,8 @@ static void handleCommand(const char* text) {
     setFlash(d["value"] | 0);
   } else if (!strcmp(cmd, "name")) {
     String n = d["name"] | "";
-    if (n.length() > 0 && n.length() <= 29) {
-      cfg.name = n;
-      saveSettings();
-      rebootAt = millis() + 500;  // BLE-Name wird beim Neustart übernommen
-    }
+    n.trim();
+    if (validName(n)) setName(n);
   } else if (!strcmp(cmd, "reset")) {
     prefs.begin("cam", false);
     prefs.clear();
@@ -518,45 +367,72 @@ static void handleCommand(const char* text) {
 }
 
 // ======================================================================
+// USB-Seriell: wird vom Web-Flasher benutzt, um den Namen zu setzen
+//   NAME=<name>   ->  OK NAME=<name>   (danach Neustart)
+//   INFO          ->  INFO {json}
+// ======================================================================
+
+static void handleSerial() {
+  static String line;
+  while (Serial.available()) {
+    char ch = Serial.read();
+    if (ch == '\r') continue;
+    if (ch != '\n') {
+      if (line.length() < 128) line += ch;
+      continue;
+    }
+    line.trim();
+    if (line.startsWith("NAME=")) {
+      String n = line.substring(5);
+      n.trim();
+      if (validName(n)) {
+        Serial.printf("OK NAME=%s\n", n.c_str());
+        Serial.flush();
+        setName(n);
+      } else {
+        Serial.printf("ERR NAME (1-%d Bytes)\n", NAME_MAX_BYTES);
+      }
+    } else if (line == "INFO") {
+      Serial.printf("INFO %s\n", statusJson().c_str());
+    }
+    line = "";
+  }
+}
+
+// ======================================================================
 
 void setup() {
-  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);  // ESP32-CAM bricht sonst beim WLAN-Start oft ein
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);  // ESP32-CAM bricht bei Stromspitzen sonst oft ein
   Serial.begin(115200);
-  Serial.println("\nESP32-CAM BLE " FW_VERSION);
+  Serial.println("\nHelm Camera BLE " FW_VERSION);
 
   pinMode(STATUS_LED_PIN, OUTPUT);
   digitalWrite(STATUS_LED_PIN, HIGH);
   pinMode(FLASH_LED_PIN, OUTPUT);
   setFlash(0);
 
-  WiFi.mode(WIFI_AP);  // nötig, damit die MAC für den Namen gelesen werden kann
   loadSettings();
   cameraOk = initCamera();
-
   cmdQueue = xQueueCreate(8, CMD_MAX);
-  startWifi();
-  startWebServer();
   startBluetooth();
+  Serial.printf("READY NAME=%s\n", cfg.name.c_str());
 }
 
 void loop() {
   char cmd[CMD_MAX];
   while (xQueueReceive(cmdQueue, cmd, 0) == pdTRUE) handleCommand(cmd);
+  handleSerial();
 
-  if (wifiRestart) {
-    wifiRestart = false;
-    startWifi();
+  if (stopStream) {
+    stopStream = false;
+    streaming = false;
+    setFlash(0);
     statusDirty = true;
   }
 
-  static wl_status_t lastSta = WL_IDLE_STATUS;
-  static int lastClients = -1;
-  wl_status_t sta = WiFi.status();
-  int clients = WiFi.softAPgetStationNum();
-  if (sta != lastSta || clients != lastClients) {
-    lastSta = sta;
-    lastClients = clients;
-    statusDirty = true;
+  if (streaming && bleConn != BLE_HS_CONN_HANDLE_NONE && millis() - lastFrameAt >= (uint32_t)cfg.interval) {
+    lastFrameAt = millis();
+    sendFrame();
   }
 
   static uint32_t lastStatus = 0;
@@ -566,9 +442,9 @@ void loop() {
     publishStatus();
   }
 
-  // Rote LED blinkt kurz, solange kein Handy per Bluetooth verbunden ist
+  // Rote LED blitzt kurz alle 2 s, solange kein Handy verbunden ist
   digitalWrite(STATUS_LED_PIN, (bleConn == BLE_HS_CONN_HANDLE_NONE && (millis() % 2000) < 80) ? LOW : HIGH);
 
   if (rebootAt && millis() > rebootAt) ESP.restart();
-  delay(10);
+  delay(streaming ? 1 : 10);
 }

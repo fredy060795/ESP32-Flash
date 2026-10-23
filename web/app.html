@@ -3,41 +3,30 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ESP32-CAM App</title>
+<title>Helm Camera Test</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
 <main>
-  <h1>ESP32-CAM</h1>
-  <p class="lead" id="sub">Kamera über Bluetooth verbinden.</p>
+  <h1>Helm Camera testen</h1>
+  <p class="lead" id="sub">Kamera über Bluetooth verbinden. Das Handy bleibt dabei im normalen Internet.</p>
 
   <section class="card" id="connectCard">
     <p id="unsupported" class="warn hidden">Dieser Browser unterstützt kein Bluetooth.
       Android: Chrome · PC/Mac: Chrome oder Edge · iPhone: App „Bluefy“.</p>
     <button class="pri" id="connect">Verbinden</button>
-    <p class="note">Die Kamera muss eingeschaltet sein (rote LED blinkt kurz alle 2 Sekunden).</p>
+    <p class="note">Die Kamera muss eingeschaltet sein (rote LED blitzt kurz alle 2 Sekunden).</p>
   </section>
 
   <div id="ui" class="hidden">
     <section class="card">
-      <div class="view" id="view"><span id="viewText">Kein Bild</span><img id="img" class="hidden" alt="Kamerabild"></div>
+      <div class="view"><span id="viewText">Kein Bild</span><img id="img" class="hidden" alt="Kamerabild"></div>
       <div class="row">
-        <button class="pri" id="live">Live über Bluetooth</button>
+        <button class="pri" id="live">Live</button>
         <button id="snap">Foto</button>
         <button id="save" disabled>Speichern</button>
       </div>
       <p class="note" id="fps"></p>
-    </section>
-
-    <section class="card">
-      <h2>Flüssiges Video über WLAN</h2>
-      <dl class="kv">
-        <dt>Hotspot</dt><dd id="apSsid">–</dd>
-        <dt>Passwort</dt><dd id="apPass">–</dd>
-        <dt>Heim-WLAN</dt><dd id="sta">–</dd>
-      </dl>
-      <p class="note">Handy mit dem Hotspot verbinden, dann öffnen:</p>
-      <div class="row" id="links"></div>
     </section>
 
     <section class="card">
@@ -60,30 +49,16 @@
     </section>
 
     <section class="card">
-      <h2>Mit Heim-WLAN verbinden (optional)</h2>
-      <label for="ssid">WLAN-Name</label><input id="ssid" autocomplete="off">
-      <label for="pass">Passwort</label><input id="pass" type="password" autocomplete="off">
-      <div class="row"><button class="pri" id="wifiSave">Speichern</button><button id="wifiClear">Entfernen</button></div>
-      <p class="note">Der Hotspot der Kamera bleibt trotzdem immer an.</p>
-    </section>
-
-    <section class="card">
-      <h2>Hotspot der Kamera</h2>
-      <label for="apName">Name</label><input id="apName" maxlength="32" autocomplete="off">
-      <label for="apPw">Passwort (mind. 8 Zeichen, leer = offen)</label><input id="apPw" autocomplete="off">
-      <div class="row"><button class="pri" id="apSave">Speichern</button></div>
-    </section>
-
-    <section class="card">
       <h2>Gerät</h2>
       <dl class="kv">
         <dt>Name</dt><dd id="devName">–</dd>
         <dt>Firmware</dt><dd id="fw">–</dd>
         <dt>Kamera</dt><dd id="camOk">–</dd>
       </dl>
+      <label for="newName">Neuer Name</label>
+      <div class="row"><input id="newName" maxlength="29" autocomplete="off"><button id="rename">Umbenennen</button></div>
       <div class="row">
         <button id="reboot">Neu starten</button>
-        <button id="reset">Werkseinstellungen</button>
         <button id="disconnect">Trennen</button>
       </div>
     </section>
@@ -91,7 +66,7 @@
   <p class="note"><a href="index.html">Zum Flasher</a></p>
 </main>
 <script>
-// Muss zu den UUIDs in firmware/esp32cam_ble/esp32cam_ble.ino passen
+// Protokoll: PROTOCOL.md im Repository
 const SVC = '7b3c0001-6b1a-4d6e-9c55-3a2f1e0c8a01';
 const STATUS = '7b3c0002-6b1a-4d6e-9c55-3a2f1e0c8a01';
 const COMMAND = '7b3c0003-6b1a-4d6e-9c55-3a2f1e0c8a01';
@@ -99,12 +74,12 @@ const IMAGE = '7b3c0004-6b1a-4d6e-9c55-3a2f1e0c8a01';
 const IMG_START = 1, IMG_DATA = 2, IMG_END = 3, IMG_ERROR = 4;
 
 const $ = id => document.getElementById(id);
-let device, statusChr, commandChr, imageChr;
+let device, statusChr, commandChr;
 let status = {};
 let live = false;
-let frame = null;          // {buf, received}
-let frameWaiter = null;    // resolve-Funktion für das laufende Bild
+let frame = null;
 let lastBlob = null;
+let frames = 0, t0 = performance.now();
 let writeChain = Promise.resolve();
 
 if (!navigator.bluetooth) {
@@ -134,27 +109,11 @@ function render() {
   $('devName').textContent = s.name;
   $('fw').textContent = s.fw;
   $('camOk').textContent = s.camera ? 'OK' : 'nicht gefunden – Kamerakabel prüfen';
-  $('apSsid').textContent = s.ap_ssid;
-  $('apPass').textContent = s.ap_pass || '(offen)';
-  $('sta').textContent = s.sta_ssid ? (s.sta_ssid + (s.sta_connected ? ' – verbunden, ' + s.sta_ip : ' – nicht verbunden')) : 'nicht eingerichtet';
-  const links = $('links');
-  links.innerHTML = '';
-  const add = (ip, label) => {
-    const a = document.createElement('a');
-    a.href = 'http://' + ip + '/';
-    a.target = '_blank';
-    a.className = 'btn';
-    a.textContent = label + ' (' + ip + ')';
-    links.appendChild(a);
-  };
-  add(s.ap_ip, 'Hotspot');
-  if (s.sta_connected) add(s.sta_ip, 'Heim-WLAN');
-  if (document.activeElement !== $('fs')) $('fs').value = s.framesize;
-  if (document.activeElement !== $('q')) $('q').value = s.quality;
-  if (document.activeElement !== $('flash')) $('flash').value = s.flash;
-  if (document.activeElement !== $('apName')) $('apName').value = s.ap_ssid;
-  if (document.activeElement !== $('apPw')) $('apPw').value = s.ap_pass;
-  if (document.activeElement !== $('ssid')) $('ssid').value = s.sta_ssid;
+  for (const [id, key] of [['fs', 'framesize'], ['q', 'quality'], ['flash', 'flash']]) {
+    if (document.activeElement !== $(id)) $(id).value = s[key];
+  }
+  live = s.streaming;
+  $('live').textContent = live ? 'Stopp' : 'Live';
 }
 
 function onImage(ev) {
@@ -168,19 +127,20 @@ function onImage(ev) {
     frame.buf.set(part, off);
     frame.received += part.length;
   } else if (type === IMG_END && frame) {
-    const ok = frame.received === frame.buf.length;
-    if (ok) showImage(new Blob([frame.buf], { type: 'image/jpeg' }));
+    if (frame.received === frame.buf.length) {
+      showImage(new Blob([frame.buf], { type: 'image/jpeg' }));
+      frames++;
+    }
     frame = null;
-    finishFrame(ok);
+    const dt = (performance.now() - t0) / 1000;
+    if (dt > 2) {
+      $('fps').textContent = (frames / dt).toFixed(1) + ' Bilder/s';
+      frames = 0; t0 = performance.now();
+    }
   } else if (type === IMG_ERROR) {
-    const msg = new TextDecoder().decode(new Uint8Array(dv.buffer, dv.byteOffset + 1, dv.byteLength - 1));
-    $('viewText').textContent = msg;
-    finishFrame(false);
+    $('viewText').textContent = new TextDecoder().decode(new Uint8Array(dv.buffer, dv.byteOffset + 1, dv.byteLength - 1));
+    $('viewText').classList.remove('hidden');
   }
-}
-
-function finishFrame(ok) {
-  if (frameWaiter) { const w = frameWaiter; frameWaiter = null; w(ok); }
 }
 
 function showImage(blob) {
@@ -193,29 +153,6 @@ function showImage(blob) {
   $('save').disabled = false;
 }
 
-function requestFrame() {
-  return new Promise(resolve => {
-    frameWaiter = resolve;
-    send({ cmd: 'snap' });
-    setTimeout(() => { if (frameWaiter === resolve) { frame = null; finishFrame(false); } }, 10000);
-  });
-}
-
-async function liveLoop() {
-  let count = 0, t0 = performance.now();
-  while (live && device && device.gatt.connected) {
-    const ok = await requestFrame();
-    if (ok) count++;
-    const dt = (performance.now() - t0) / 1000;
-    if (dt > 2) {
-      $('fps').textContent = (count / dt).toFixed(1) + ' Bilder/s über Bluetooth';
-      count = 0; t0 = performance.now();
-    }
-  }
-  live = false;
-  $('live').textContent = 'Live über Bluetooth';
-}
-
 $('connect').onclick = async () => {
   try {
     device = await navigator.bluetooth.requestDevice({ filters: [{ services: [SVC] }] });
@@ -225,12 +162,13 @@ $('connect').onclick = async () => {
     const svc = await server.getPrimaryService(SVC);
     statusChr = await svc.getCharacteristic(STATUS);
     commandChr = await svc.getCharacteristic(COMMAND);
-    imageChr = await svc.getCharacteristic(IMAGE);
+    const imageChr = await svc.getCharacteristic(IMAGE);
     await imageChr.startNotifications();
     imageChr.addEventListener('characteristicvaluechanged', onImage);
     await statusChr.startNotifications();
     statusChr.addEventListener('characteristicvaluechanged', () => readStatus());
     await readStatus();
+    $('newName').value = status.name || '';
     $('connectCard').classList.add('hidden');
     $('ui').classList.remove('hidden');
   } catch (e) {
@@ -242,7 +180,7 @@ $('connect').onclick = async () => {
 
 function onDisconnected() {
   live = false;
-  finishFrame(false);
+  frame = null;
   $('ui').classList.add('hidden');
   $('connectCard').classList.remove('hidden');
   $('connect').textContent = 'Verbinden';
@@ -250,11 +188,10 @@ function onDisconnected() {
 }
 
 $('disconnect').onclick = () => device && device.gatt.disconnect();
-$('snap').onclick = () => { if (!live) requestFrame(); };
+$('snap').onclick = () => { if (!live) send({ cmd: 'snap' }); };
 $('live').onclick = () => {
-  live = !live;
-  $('live').textContent = live ? 'Stopp' : 'Live über Bluetooth';
-  if (live) liveLoop();
+  frames = 0; t0 = performance.now(); $('fps').textContent = '';
+  send({ cmd: 'stream', on: !live });
 };
 $('save').onclick = () => {
   if (!lastBlob) return;
@@ -266,22 +203,12 @@ $('save').onclick = () => {
 $('fs').onchange = () => send({ cmd: 'cam', framesize: +$('fs').value });
 $('q').onchange = () => send({ cmd: 'cam', quality: +$('q').value });
 $('flash').onchange = () => send({ cmd: 'flash', value: +$('flash').value });
-$('wifiSave').onclick = () => {
-  if (!$('ssid').value) return alert('Bitte WLAN-Name eingeben.');
-  send({ cmd: 'wifi', ssid: $('ssid').value, pass: $('pass').value });
-  $('pass').value = '';
-};
-$('wifiClear').onclick = () => send({ cmd: 'wifi', ssid: '', pass: '' });
-$('apSave').onclick = () => {
-  const pw = $('apPw').value;
-  if (pw.length > 0 && pw.length < 8) return alert('Passwort muss mindestens 8 Zeichen haben (oder leer für offen).');
-  if (!$('apName').value) return alert('Bitte einen Namen eingeben.');
-  send({ cmd: 'ap', ssid: $('apName').value, pass: pw });
+$('rename').onclick = () => {
+  const n = $('newName').value.trim();
+  if (!n || new TextEncoder().encode(n).length > 29) return alert('Name: 1 bis 29 Zeichen (Umlaute zählen doppelt).');
+  if (confirm('Kamera in „' + n + '“ umbenennen? Sie startet dafür neu.')) send({ cmd: 'name', name: n });
 };
 $('reboot').onclick = () => send({ cmd: 'reboot' });
-$('reset').onclick = () => {
-  if (confirm('Alle Einstellungen der Kamera zurücksetzen?')) send({ cmd: 'reset' });
-};
 </script>
 </body>
 </html>
