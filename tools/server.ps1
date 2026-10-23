@@ -14,7 +14,9 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'  # sonst sind Downloads in PowerShell 5.1 sehr langsam
 $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $Web = Join-Path $Root 'web'
-$Firmware = Join-Path $Web 'firmware\esp32cam_ble.bin'
+$Firmware = Join-Path $Web 'firmware\esp32cam_ble.bin'                  # neueste, aus dem Internet
+$BundledFirmware = Join-Path $Root 'firmware\bin\esp32cam_ble.bin'      # im Ordner mitgeliefert
+$UploadFirmware = Join-Path ([IO.Path]::GetTempPath()) 'helm-camera-upload.bin'
 $EsptoolDir = Join-Path $Root 'tools\esptool'
 $Esptool = Join-Path $EsptoolDir 'esptool.exe'
 $LogFile = Join-Path ([IO.Path]::GetTempPath()) 'helm-camera-flasher.log'
@@ -23,6 +25,7 @@ $FirmwareUrl = 'https://fredy060795.github.io/ESP32-Flash/firmware/esp32cam_ble.
 $EsptoolUrl = 'https://github.com/espressif/esptool/releases/download/v4.8.1/esptool-v4.8.1-win64.zip'
 
 $script:Job = $null
+$script:UploadName = $null   # Name der auf der Seite ausgewaehlten Firmware-Datei
 
 # ----------------------------------------------------------------------
 # Vorbereitung
@@ -38,8 +41,13 @@ function Get-Downloads {
         Move-Item -Force "$Firmware.download" $Firmware
     } catch {
         Remove-Item -Force "$Firmware.download" -ErrorAction SilentlyContinue
-        if (-not (Test-Path $Firmware)) { throw }
-        Write-Host 'Kein Download moeglich, vorhandene Firmware wird verwendet.'
+        if (Test-Path $Firmware) {
+            Write-Host 'Online nicht erreichbar, zuletzt geladene Firmware wird verwendet.'
+        } elseif (Test-Path $BundledFirmware) {
+            Write-Host 'Online nicht erreichbar, Firmware aus dem Ordner wird verwendet.'
+        } else {
+            Write-Host 'Keine Firmware gefunden. Auf der Seite eine .bin-Datei auswaehlen.' -ForegroundColor Yellow
+        }
     }
     if ($IsLinux -or $IsMacOS) { return }  # nur zum Testen ausserhalb von Windows
     if (-not (Test-Path $Esptool)) {
@@ -53,6 +61,47 @@ function Get-Downloads {
         Copy-Item -Path (Join-Path $tmp 'esptool-win64\*') -Destination $EsptoolDir -Recurse -Force
         Remove-Item -Recurse -Force $tmp, $zip
     }
+}
+
+# ----------------------------------------------------------------------
+# Firmware: ausgewaehlte Datei > aus dem Internet geladen > im Ordner mitgeliefert
+# ----------------------------------------------------------------------
+
+function Get-FirmwareInfo {
+    if ($script:UploadName -and (Test-Path $UploadFirmware)) {
+        return [pscustomobject]@{ path = $UploadFirmware; source = 'Datei: ' + $script:UploadName; size = (Get-Item $UploadFirmware).Length }
+    }
+    if (Test-Path $Firmware) {
+        return [pscustomobject]@{ path = $Firmware; source = 'neueste Version (online geladen)'; size = (Get-Item $Firmware).Length }
+    }
+    if (Test-Path $BundledFirmware) {
+        return [pscustomobject]@{ path = $BundledFirmware; source = 'aus dem Ordner (firmware\bin)'; size = (Get-Item $BundledFirmware).Length }
+    }
+    return [pscustomobject]@{ path = $null; source = $null; size = 0 }
+}
+
+function Set-UploadedFirmware($ctx) {
+    $ms = New-Object IO.MemoryStream
+    $ctx.Request.InputStream.CopyTo($ms)
+    [byte[]]$bytes = $ms.ToArray()
+    if ($bytes.Length -eq 0) {
+        # leere Anfrage = Auswahl zuruecksetzen
+        $script:UploadName = $null
+        Remove-Item -Force $UploadFirmware -ErrorAction SilentlyContinue
+        return
+    }
+    if ($bytes.Length -gt 4MB) { throw 'Datei ist zu gross fuer die ESP32-CAM (max. 4 MB).' }
+    if ($bytes.Length -gt 0x1000 -and $bytes[0x1000] -eq 0xE9) {
+        # zusammengesetztes Image ab 0x0 (Bootloader bei 0x1000) - passt
+    } elseif ($bytes[0] -eq 0xE9) {
+        throw 'Das ist nur der App-Teil. Bitte die komplette Datei esp32cam_ble.bin (ab Adresse 0x0) waehlen.'
+    } else {
+        throw 'Keine gueltige ESP32-Firmware (.bin).'
+    }
+    [IO.File]::WriteAllBytes($UploadFirmware, $bytes)
+    $name = [Uri]::UnescapeDataString([string]$ctx.Request.Headers['X-File-Name'])
+    if (-not $name) { $name = 'firmware.bin' }
+    $script:UploadName = $name
 }
 
 # ----------------------------------------------------------------------
@@ -146,11 +195,12 @@ function Start-Work($Mode, $Body) {
     $bytes = [Text.Encoding]::UTF8.GetByteCount($name)
     if ($bytes -lt 1 -or $bytes -gt 29) { throw 'Name muss 1 bis 29 Zeichen haben.' }
     if (-not ([string]$Body.port -match '^COM\d+$|^/dev/')) { throw 'Bitte einen COM-Port waehlen.' }
-    if ($Mode -eq 'flash' -and -not (Test-Path $Firmware)) { throw 'Firmware-Datei fehlt.' }
+    $fw = (Get-FirmwareInfo).path
+    if ($Mode -eq 'flash' -and -not $fw) { throw 'Keine Firmware vorhanden. Bitte unter "Firmware" eine .bin-Datei auswaehlen.' }
     if ($Mode -eq 'flash' -and -not (Test-Path $Esptool)) { throw 'esptool.exe fehlt.' }
     Set-Content -Path $LogFile -Value '' -Encoding UTF8
     if ($script:Job) { Remove-Job -Job $script:Job -Force -ErrorAction SilentlyContinue }
-    $script:Job = Start-Job -ScriptBlock $Worker -ArgumentList $Mode, $Esptool, $Firmware, ([string]$Body.port), $name, ([bool]$Body.erase), $LogFile
+    $script:Job = Start-Job -ScriptBlock $Worker -ArgumentList $Mode, $Esptool, $fw, ([string]$Body.port), $name, ([bool]$Body.erase), $LogFile
 }
 
 function Get-Status {
@@ -201,6 +251,12 @@ function Handle($ctx) {
     try {
         if ($path -eq '/api/ports') { Send-Json $ctx 200 @(Get-ComPorts); return }
         if ($path -eq '/api/status') { Send-Json $ctx 200 (Get-Status); return }
+        if ($path -eq '/api/firmware' -and $method -eq 'GET') { Send-Json $ctx 200 (Get-FirmwareInfo); return }
+        if ($path -eq '/api/firmware' -and $method -eq 'POST') {
+            if ($script:Job -and $script:Job.State -eq 'Running') { throw 'Es laeuft gerade ein Vorgang.' }
+            Set-UploadedFirmware $ctx
+            Send-Json $ctx 200 (Get-FirmwareInfo); return
+        }
         if ($path -eq '/api/flash' -and $method -eq 'POST') { Start-Work 'flash' (Read-Body $ctx); Send-Json $ctx 200 @{ ok = $true }; return }
         if ($path -eq '/api/rename' -and $method -eq 'POST') { Start-Work 'rename' (Read-Body $ctx); Send-Json $ctx 200 @{ ok = $true }; return }
     } catch {
