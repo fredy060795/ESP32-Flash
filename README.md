@@ -8,14 +8,25 @@ als Bluetooth-Helmkamera.
 - **Name beim Flashen wählbar:** Standard `Helm Camera`, im Flasher frei änderbar (z. B. `Helm 1`, `Helm Alpha`).
 - **Flashen ohne Software:** Webseite in Chrome/Edge öffnen, Board anstecken, „Flashen“ klicken.
 
-## Web-Flasher
+## Flashen unter Windows mit start.bat (empfohlen)
+
+1. Repository herunterladen (**Code → Download ZIP**) und entpacken – oder das fertige Paket
+   **Helm-Camera-Flasher-Windows** unter **Actions** → letzter Lauf → Artifacts laden (funktioniert auch offline).
+2. Kamera auf das USB-C-Board stecken und mit dem PC verbinden.
+3. **start.bat** doppelklicken. Der Flasher öffnet sich im Browser (jeder Browser geht).
+4. **COM-Port** der Kamera wählen (meist „USB-SERIAL CH340 (COMx)“), Namen eintragen → **Flashen**.
+5. Warten bis „Fertig!“ erscheint, Board abziehen. Das schwarze Fenster danach schließen.
+
+`start.bat` startet einen kleinen lokalen Server (Windows PowerShell, keine Installation nötig) und lädt beim
+Start die neueste Firmware und – nur beim ersten Mal – esptool herunter.
+
+## Web-Flasher ohne Download
 
 **https://fredy060795.github.io/ESP32-Flash/**
 
-1. Kamera auf das USB-C-Board stecken und mit dem PC verbinden.
-2. Seite in **Chrome** oder **Edge** öffnen.
-3. Namen eintragen → **Flashen** → Port wählen (meist „USB-SERIAL CH340“).
-4. Warten bis „Fertig!“ erscheint, Board abziehen.
+1. Seite in **Chrome** oder **Edge** öffnen, Kamera anstecken.
+2. Bei **COM-Port** „COM-Port auswählen …“ wählen und im Browser-Fenster den Port der Kamera bestätigen.
+3. Namen eintragen → **Flashen**.
 
 Mit **Nur Namen ändern** kann man eine schon geflashte Kamera umbenennen, ohne neu zu flashen.
 
