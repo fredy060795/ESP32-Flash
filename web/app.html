@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Helm Camera Test</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <h1>Helm Camera testen</h1>
+  <p class="lead" id="sub">Kamera über Bluetooth verbinden. Das Handy bleibt dabei im normalen Internet.</p>
+
+  <section class="card" id="connectCard">
+    <p id="unsupported" class="warn hidden">Dieser Browser unterstützt kein Bluetooth.
+      Android: Chrome · PC/Mac: Chrome oder Edge · iPhone: App „Bluefy“.</p>
+    <button class="pri" id="connect">Verbinden</button>
+    <p class="note">Die Kamera muss eingeschaltet sein (rote LED blitzt kurz alle 2 Sekunden).</p>
+  </section>
+
+  <div id="ui" class="hidden">
+    <section class="card">
+      <div class="view"><span id="viewText">Kein Bild</span><img id="img" class="hidden" alt="Kamerabild"></div>
+      <div class="row">
+        <button class="pri" id="live">Live</button>
+        <button id="snap">Foto</button>
+        <button id="save" disabled>Speichern</button>
+      </div>
+      <p class="note" id="fps"></p>
+    </section>
+
+    <section class="card">
+      <h2>Kamera</h2>
+      <label for="fs">Auflösung</label>
+      <select id="fs">
+        <option value="1">160x120</option>
+        <option value="5">320x240</option>
+        <option value="8">640x480</option>
+        <option value="9">800x600</option>
+        <option value="10">1024x768</option>
+        <option value="11">1280x720</option>
+        <option value="13">1600x1200</option>
+      </select>
+      <label for="q">JPEG-Qualität (niedriger = besser, größer)</label>
+      <input type="range" id="q" min="8" max="40" value="12">
+      <label for="flash">Licht</label>
+      <input type="range" id="flash" min="0" max="255" value="0">
+      <p class="note">Für Live über Bluetooth 320x240 oder kleiner wählen.</p>
+    </section>
+
+    <section class="card">
+      <h2>Gerät</h2>
+      <dl class="kv">
+        <dt>Name</dt><dd id="devName">–</dd>
+        <dt>Firmware</dt><dd id="fw">–</dd>
+        <dt>Kamera</dt><dd id="camOk">–</dd>
+      </dl>
+      <label for="newName">Neuer Name</label>
+      <div class="row"><input id="newName" maxlength="29" autocomplete="off"><button id="rename">Umbenennen</button></div>
+      <div class="row">
+        <button id="reboot">Neu starten</button>
+        <button id="disconnect">Trennen</button>
+      </div>
+    </section>
+  </div>
+  <p class="note"><a href="index.html">Zum Flasher</a></p>
+</main>
+<script>
+// Protokoll: PROTOCOL.md im Repository
+const SVC = '7b3c0001-6b1a-4d6e-9c55-3a2f1e0c8a01';
+const STATUS = '7b3c0002-6b1a-4d6e-9c55-3a2f1e0c8a01';
+const COMMAND = '7b3c0003-6b1a-4d6e-9c55-3a2f1e0c8a01';
+const IMAGE = '7b3c0004-6b1a-4d6e-9c55-3a2f1e0c8a01';
+const IMG_START = 1, IMG_DATA = 2, IMG_END = 3, IMG_ERROR = 4;
+
+const $ = id => document.getElementById(id);
+let device, statusChr, commandChr;
+let status = {};
+let live = false;
+let frame = null;
+let lastBlob = null;
+let frames = 0, t0 = performance.now();
+let writeChain = Promise.resolve();
+
+if (!navigator.bluetooth) {
+  $('unsupported').classList.remove('hidden');
+  $('connect').disabled = true;
+}
+
+function send(obj) {
+  // Schreibvorgänge nacheinander, sonst meldet der Browser "GATT operation already in progress"
+  writeChain = writeChain.then(() =>
+    commandChr.writeValueWithResponse(new TextEncoder().encode(JSON.stringify(obj)))
+  ).catch(e => console.warn(e));
+  return writeChain;
+}
+
+async function readStatus() {
+  try {
+    const v = await statusChr.readValue();
+    status = JSON.parse(new TextDecoder().decode(v));
+    render();
+  } catch (e) { console.warn('Status', e); }
+}
+
+function render() {
+  const s = status;
+  $('sub').textContent = 'Verbunden mit ' + s.name;
+  $('devName').textContent = s.name;
+  $('fw').textContent = s.fw;
+  $('camOk').textContent = s.camera ? 'OK' : 'nicht gefunden – Kamerakabel prüfen';
+  for (const [id, key] of [['fs', 'framesize'], ['q', 'quality'], ['flash', 'flash']]) {
+    if (document.activeElement !== $(id)) $(id).value = s[key];
+  }
+  live = s.streaming;
+  $('live').textContent = live ? 'Stopp' : 'Live';
+}
+
+function onImage(ev) {
+  const dv = ev.target.value;
+  const type = dv.getUint8(0);
+  if (type === IMG_START) {
+    frame = { buf: new Uint8Array(dv.getUint32(1, true)), received: 0 };
+  } else if (type === IMG_DATA && frame) {
+    const off = dv.getUint32(1, true);
+    const part = new Uint8Array(dv.buffer, dv.byteOffset + 5, dv.byteLength - 5);
+    frame.buf.set(part, off);
+    frame.received += part.length;
+  } else if (type === IMG_END && frame) {
+    if (frame.received === frame.buf.length) {
+      showImage(new Blob([frame.buf], { type: 'image/jpeg' }));
+      frames++;
+    }
+    frame = null;
+    const dt = (performance.now() - t0) / 1000;
+    if (dt > 2) {
+      $('fps').textContent = (frames / dt).toFixed(1) + ' Bilder/s';
+      frames = 0; t0 = performance.now();
+    }
+  } else if (type === IMG_ERROR) {
+    $('viewText').textContent = new TextDecoder().decode(new Uint8Array(dv.buffer, dv.byteOffset + 1, dv.byteLength - 1));
+    $('viewText').classList.remove('hidden');
+  }
+}
+
+function showImage(blob) {
+  const img = $('img');
+  if (img.src) URL.revokeObjectURL(img.src);
+  img.src = URL.createObjectURL(blob);
+  img.classList.remove('hidden');
+  $('viewText').classList.add('hidden');
+  lastBlob = blob;
+  $('save').disabled = false;
+}
+
+$('connect').onclick = async () => {
+  try {
+    device = await navigator.bluetooth.requestDevice({ filters: [{ services: [SVC] }] });
+    device.addEventListener('gattserverdisconnected', onDisconnected);
+    $('connect').textContent = 'Verbinde …';
+    const server = await device.gatt.connect();
+    const svc = await server.getPrimaryService(SVC);
+    statusChr = await svc.getCharacteristic(STATUS);
+    commandChr = await svc.getCharacteristic(COMMAND);
+    const imageChr = await svc.getCharacteristic(IMAGE);
+    await imageChr.startNotifications();
+    imageChr.addEventListener('characteristicvaluechanged', onImage);
+    await statusChr.startNotifications();
+    statusChr.addEventListener('characteristicvaluechanged', () => readStatus());
+    await readStatus();
+    $('newName').value = status.name || '';
+    $('connectCard').classList.add('hidden');
+    $('ui').classList.remove('hidden');
+  } catch (e) {
+    console.warn(e);
+    $('connect').textContent = 'Verbinden';
+    if (e.name !== 'NotFoundError') alert('Verbindung fehlgeschlagen: ' + e.message);
+  }
+};
+
+function onDisconnected() {
+  live = false;
+  frame = null;
+  $('ui').classList.add('hidden');
+  $('connectCard').classList.remove('hidden');
+  $('connect').textContent = 'Verbinden';
+  $('sub').textContent = 'Verbindung getrennt.';
+}
+
+$('disconnect').onclick = () => device && device.gatt.disconnect();
+$('snap').onclick = () => { if (!live) send({ cmd: 'snap' }); };
+$('live').onclick = () => {
+  frames = 0; t0 = performance.now(); $('fps').textContent = '';
+  send({ cmd: 'stream', on: !live });
+};
+$('save').onclick = () => {
+  if (!lastBlob) return;
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(lastBlob);
+  a.download = 'foto-' + new Date().toISOString().replace(/[:.]/g, '-') + '.jpg';
+  a.click();
+};
+$('fs').onchange = () => send({ cmd: 'cam', framesize: +$('fs').value });
+$('q').onchange = () => send({ cmd: 'cam', quality: +$('q').value });
+$('flash').onchange = () => send({ cmd: 'flash', value: +$('flash').value });
+$('rename').onclick = () => {
+  const n = $('newName').value.trim();
+  if (!n || new TextEncoder().encode(n).length > 29) return alert('Name: 1 bis 29 Zeichen (Umlaute zählen doppelt).');
+  if (confirm('Kamera in „' + n + '“ umbenennen? Sie startet dafür neu.')) send({ cmd: 'name', name: n });
+};
+$('reboot').onclick = () => send({ cmd: 'reboot' });
+</script>
+</body>
+</html>

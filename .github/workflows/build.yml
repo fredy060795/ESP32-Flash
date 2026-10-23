@@ -1,0 +1,69 @@
+name: Firmware bauen & Web-Flasher veröffentlichen
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: arduino/setup-arduino-cli@v2
+
+      - name: ESP32-Core und Bibliotheken installieren
+        run: |
+          arduino-cli core update-index --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          arduino-cli core install esp32:esp32@2.0.17 --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          arduino-cli lib install "NimBLE-Arduino@1.4.3" "ArduinoJson@7.2.1"
+          pip install esptool==4.8.1
+
+      - name: Firmware kompilieren
+        run: |
+          arduino-cli compile --fqbn esp32:esp32:esp32cam:PartitionScheme=huge_app \
+            --output-dir build firmware/esp32cam_ble
+
+      - name: Ein Flash-Image erzeugen (ab Adresse 0x0)
+        run: |
+          BOOT_APP0=$(ls ~/.arduino15/packages/esp32/hardware/esp32/2.0.17/tools/partitions/boot_app0.bin)
+          mkdir -p site/firmware
+          cp web/* site/
+          esptool.py --chip esp32 merge_bin -o site/firmware/esp32cam_ble.bin \
+            --flash_mode keep --flash_freq keep --flash_size 4MB \
+            0x1000 build/esp32cam_ble.ino.bootloader.bin \
+            0x8000 build/esp32cam_ble.ino.partitions.bin \
+            0xe000 "$BOOT_APP0" \
+            0x10000 build/esp32cam_ble.ino.bin
+          ls -la site site/firmware
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: esp32cam_ble-firmware
+          path: site/firmware/esp32cam_ble.bin
+
+      - uses: actions/upload-pages-artifact@v3
+        if: github.ref == 'refs/heads/main'
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

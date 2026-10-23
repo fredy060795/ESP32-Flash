@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Helm Camera Flasher</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <h1>Helm Camera Flasher</h1>
+  <p class="lead">Firmware für die ESP32-CAM (OV2640) als Bluetooth-Helmkamera.
+    Board anstecken, Namen eingeben, „Flashen“ klicken – keine Software nötig.</p>
+
+  <p id="unsupported" class="card warn hidden">Dieser Browser kann nicht flashen.
+    Bitte <b>Chrome</b> oder <b>Edge</b> am PC/Mac verwenden.</p>
+
+  <section class="card">
+    <h2>Kamera flashen</h2>
+    <ol>
+      <li>Kamera auf das USB-C-Board (ESP32-CAM-MB) stecken und per USB-Kabel an den PC anschließen.</li>
+      <li>Bluetooth-Namen der Kamera eingeben (so erscheint sie später auf dem Handy).</li>
+      <li>Auf <b>Flashen</b> klicken und den Port wählen (meist „USB-SERIAL CH340“).</li>
+    </ol>
+    <label for="name">Name der Kamera (max. 29 Zeichen)</label>
+    <input id="name" value="Helm Camera" maxlength="29" autocomplete="off">
+    <label class="check"><input type="checkbox" id="erase" checked> Kamera vorher komplett löschen (empfohlen)</label>
+    <div class="row">
+      <button class="pri" id="flash">Flashen</button>
+      <button id="rename">Nur Namen ändern</button>
+    </div>
+    <progress id="progress" max="100" value="0" class="hidden"></progress>
+    <p id="state" class="state"></p>
+    <details>
+      <summary>Protokoll</summary>
+      <pre id="log"></pre>
+    </details>
+    <details>
+      <summary>Kein Port zu sehen / Verbindung klappt nicht?</summary>
+      <ul>
+        <li>Windows braucht den <b>CH340-Treiber</b> (einmalig installieren, dann Board neu anstecken).</li>
+        <li>Ein Kabel verwenden, das Daten überträgt – reine Ladekabel funktionieren nicht.</li>
+        <li><b>IO0</b>-Knopf am USB-Board gedrückt halten, kurz <b>RST</b> drücken,
+          IO0 loslassen und erneut auf Flashen klicken.</li>
+      </ul>
+    </details>
+  </section>
+
+  <section class="card">
+    <h2>Danach</h2>
+    <p>Die Kamera startet sofort mit Bluetooth, ohne WLAN und ohne Passwort.
+      Die rote LED auf der Rückseite blitzt alle 2 Sekunden kurz, solange kein Handy verbunden ist.</p>
+    <p>Zum Ausprobieren: <a href="app.html">Kamera testen</a> (Bluetooth im Browser: Android mit Chrome,
+      PC/Mac mit Chrome oder Edge, iPhone mit der App „Bluefy“).</p>
+  </section>
+</main>
+<script type="module">
+import { ESPLoader, Transport } from 'https://unpkg.com/esptool-js@0.6.1/bundle.js';
+
+const FIRMWARE_URL = 'firmware/esp32cam_ble.bin';
+const NAME_MAX_BYTES = 29;
+const $ = id => document.getElementById(id);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+let busy = false;
+
+if (!('serial' in navigator)) {
+  $('unsupported').classList.remove('hidden');
+  $('flash').disabled = $('rename').disabled = true;
+}
+
+const log = text => { $('log').textContent += text; $('log').scrollTop = 1e9; };
+const terminal = { clean() {}, writeLine: t => log(t + '\n'), write: t => log(t) };
+const setState = (text, cls = '') => { $('state').textContent = text; $('state').className = 'state ' + cls; };
+
+function checkName() {
+  const name = $('name').value.trim();
+  const bytes = new TextEncoder().encode(name).length;
+  if (!name || bytes > NAME_MAX_BYTES) {
+    setState('Bitte einen Namen mit 1 bis ' + NAME_MAX_BYTES + ' Zeichen eingeben (Umlaute zählen doppelt).', 'err');
+    return null;
+  }
+  return name;
+}
+
+// Setzt den Namen über die serielle Schnittstelle. Die Firmware antwortet mit
+// "OK NAME=<name>" und startet neu.
+async function sendName(port, name, resetFirst) {
+  await port.open({ baudRate: 115200 });
+  const reader = port.readable.getReader();
+  const writer = port.writable.getWriter();
+  let text = '';
+  let done = false;
+  const reading = (async () => {
+    const dec = new TextDecoder();
+    try {
+      while (!done) {
+        const { value, done: end } = await reader.read();
+        if (end) break;
+        const chunk = dec.decode(value, { stream: true });
+        text += chunk;
+        log(chunk);
+      }
+    } catch (e) { /* Port geschlossen */ }
+  })();
+  try {
+    // DTR/RTS loslassen, sonst hält das USB-Board den Chip im Reset
+    await port.setSignals({ dataTerminalReady: false, requestToSend: false });
+    if (resetFirst) {
+      await port.setSignals({ requestToSend: true });
+      await sleep(100);
+      await port.setSignals({ requestToSend: false });
+    }
+    const line = new TextEncoder().encode('NAME=' + name + '\n');
+    for (let i = 0; i < 20; i++) {
+      if (text.includes('OK NAME=')) return true;
+      if (text.includes('ERR NAME')) return false;
+      await writer.write(line);
+      await sleep(1000);
+    }
+    return text.includes('OK NAME=');
+  } finally {
+    done = true;
+    await reader.cancel().catch(() => {});
+    await reading;
+    reader.releaseLock();
+    writer.releaseLock();
+    await port.close().catch(() => {});
+  }
+}
+
+async function run(withFlash) {
+  if (busy) return;
+  const name = checkName();
+  if (!name) return;
+  let port;
+  try {
+    port = await navigator.serial.requestPort();
+  } catch (e) {
+    return; // Auswahl abgebrochen
+  }
+  busy = true;
+  $('flash').disabled = $('rename').disabled = true;
+  $('log').textContent = '';
+  try {
+    if (withFlash) {
+      setState('Firmware wird geladen …');
+      const resp = await fetch(FIRMWARE_URL, { cache: 'no-store' });
+      if (!resp.ok) throw new Error('Firmware nicht gefunden (' + resp.status + ')');
+      const data = new Uint8Array(await resp.arrayBuffer());
+
+      setState('Verbinde mit der Kamera …');
+      const transport = new Transport(port, false);
+      const loader = new ESPLoader({ transport, baudrate: 460800, terminal });
+      const chip = await loader.main();
+      if (loader.chip.CHIP_NAME !== 'ESP32') throw new Error('Falscher Chip: ' + chip + ' (erwartet ESP32-CAM)');
+
+      if ($('erase').checked) {
+        setState('Kamera wird gelöscht … (ca. 15 Sekunden)');
+        await loader.eraseFlash();
+      }
+      const bar = $('progress');
+      bar.classList.remove('hidden');
+      setState('Flashen …');
+      await loader.writeFlash({
+        fileArray: [{ data, address: 0 }],
+        flashMode: 'keep', flashFreq: 'keep', flashSize: 'keep',
+        eraseAll: false, compress: true,
+        reportProgress: (i, written, total) => {
+          bar.value = Math.round(written / total * 100);
+          setState('Flashen … ' + bar.value + ' %');
+        },
+      });
+      await loader.after('hard_reset');
+      await transport.disconnect();
+      await sleep(500);
+    }
+
+    setState('Name „' + name + '“ wird gesetzt …');
+    const ok = await sendName(port, name, !withFlash);
+    if (ok) {
+      setState('Fertig! Die Kamera heißt jetzt „' + name + '“. Board abziehen und benutzen.', 'ok');
+    } else {
+      setState('Name konnte nicht gesetzt werden. RST an der Kamera drücken und „Nur Namen ändern“ versuchen.', 'err');
+    }
+  } catch (e) {
+    console.error(e);
+    log('\n' + e + '\n');
+    setState('Fehler: ' + (e.message || e) + ' – siehe „Kein Port zu sehen“ unten.', 'err');
+    try { await port.close(); } catch (_) {}
+  } finally {
+    busy = false;
+    $('flash').disabled = $('rename').disabled = false;
+    $('progress').classList.add('hidden');
+  }
+}
+
+$('flash').onclick = () => run(true);
+$('rename').onclick = () => run(false);
+</script>
+</body>
+</html>
