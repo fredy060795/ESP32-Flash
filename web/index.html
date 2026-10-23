@@ -27,6 +27,12 @@
       <select id="port"></select>
       <button id="refresh" title="Liste neu laden">Aktualisieren</button>
     </div>
+    <label for="fwFile">Firmware</label>
+    <p class="fwinfo" id="fwInfo">…</p>
+    <div class="row">
+      <input type="file" id="fwFile" accept=".bin">
+      <button id="fwReset" class="hidden">Standard verwenden</button>
+    </div>
     <label for="name">Name der Kamera (max. 29 Zeichen)</label>
     <input id="name" value="Helm Camera" maxlength="29" autocomplete="off">
     <label class="check"><input type="checkbox" id="erase" checked> Kamera vorher komplett löschen (empfohlen)</label>
@@ -74,12 +80,13 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 let local = false;      // true = über start.bat (lokaler Server mit esptool)
 let grantedPorts = [];  // Web Serial: freigegebene Ports
 let busy = false;
+let fwFile = null;      // Browser-Modus: ausgewählte Firmware {name, data}
 
 const log = text => { $('log').textContent += text; $('log').scrollTop = 1e9; };
 const setState = (text, cls = '') => { $('state').textContent = text; $('state').className = 'state ' + cls; };
 const setBusy = b => {
   busy = b;
-  for (const id of ['flash', 'rename', 'refresh', 'port']) $(id).disabled = b;
+  for (const id of ['flash', 'rename', 'refresh', 'port', 'fwFile', 'fwReset']) $(id).disabled = b;
   if (!b) $('progress').classList.add('hidden');
 };
 
@@ -91,6 +98,71 @@ function checkName() {
     return null;
   }
   return name;
+}
+
+// ======================================================================
+// Firmware-Datei
+// ======================================================================
+
+// Erwartet das zusammengesetzte Image ab Adresse 0x0 (Bootloader bei 0x1000)
+function checkImage(bytes) {
+  if (bytes.length > 4 * 1024 * 1024) return 'Datei ist zu groß für die ESP32-CAM (max. 4 MB).';
+  if (bytes.length > 0x1000 && bytes[0x1000] === 0xe9) return null;
+  if (bytes[0] === 0xe9) return 'Das ist nur der App-Teil. Bitte die komplette Datei esp32cam_ble.bin (ab Adresse 0x0) wählen.';
+  return 'Keine gültige ESP32-Firmware (.bin).';
+}
+
+const kb = n => Math.round(n / 1024) + ' KB';
+
+function showFirmware(text, ok, custom) {
+  $('fwInfo').textContent = text;
+  $('fwInfo').className = 'fwinfo' + (ok ? '' : ' err');
+  $('fwReset').classList.toggle('hidden', !custom);
+}
+
+async function refreshFirmware() {
+  if (local) {
+    const fw = await (await fetch('/api/firmware', { cache: 'no-store' })).json();
+    if (fw.path) showFirmware(fw.source + ' · ' + kb(fw.size), true, fw.source.startsWith('Datei:'));
+    else showFirmware('Keine Firmware gefunden – bitte unten eine .bin-Datei auswählen.', false, false);
+  } else if (fwFile) {
+    showFirmware('Datei: ' + fwFile.name + ' · ' + kb(fwFile.data.length), true, true);
+  } else {
+    showFirmware('neueste Version (online)', true, false);
+  }
+}
+
+async function chooseFirmware() {
+  const file = $('fwFile').files[0];
+  if (!file) return;
+  const data = new Uint8Array(await file.arrayBuffer());
+  const err = checkImage(data);
+  $('fwFile').value = '';
+  if (err) return setState(err, 'err');
+  try {
+    if (local) {
+      const r = await fetch('/api/firmware', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/octet-stream', 'X-File-Name': encodeURIComponent(file.name) },
+        body: data,
+      });
+      const res = await r.json();
+      if (!r.ok) throw new Error(res.error);
+    } else {
+      fwFile = { name: file.name, data };
+    }
+    setState('Firmware „' + file.name + '“ ausgewählt.', 'ok');
+  } catch (e) {
+    setState('Firmware konnte nicht übernommen werden: ' + e.message, 'err');
+  }
+  await refreshFirmware();
+}
+
+async function resetFirmware() {
+  if (local) await fetch('/api/firmware', { method: 'POST', body: '' });
+  fwFile = null;
+  setState('');
+  await refreshFirmware();
 }
 
 function fillPorts(items, keep) {
@@ -245,9 +317,14 @@ async function runBrowser(withFlash, name) {
     if (withFlash) {
       setState('Flasher wird geladen …');
       const { ESPLoader, Transport } = await import(ESPTOOL_JS);
-      const resp = await fetch(FIRMWARE_URL, { cache: 'no-store' });
-      if (!resp.ok) throw new Error('Firmware nicht gefunden (' + resp.status + ')');
-      const data = new Uint8Array(await resp.arrayBuffer());
+      let data;
+      if (fwFile) {
+        data = fwFile.data;
+      } else {
+        const resp = await fetch(FIRMWARE_URL, { cache: 'no-store' });
+        if (!resp.ok) throw new Error('Firmware online nicht gefunden (' + resp.status + '). Bitte unter „Firmware“ eine .bin-Datei auswählen.');
+        data = new Uint8Array(await resp.arrayBuffer());
+      }
 
       setState('Verbinde mit der Kamera …');
       const terminal = { clean() {}, writeLine: t => log(t + '\n'), write: t => log(t) };
@@ -324,6 +401,7 @@ async function init() {
   } catch (e) { local = false; }
 
   $('mode').textContent = local ? 'lokal (start.bat)' : 'Browser';
+  try { await refreshFirmware(); } catch (e) { showFirmware('Firmware-Status unbekannt: ' + e.message, false, false); }
   if (!local && !('serial' in navigator)) {
     $('unsupported').classList.remove('hidden');
     setBusy(true);
@@ -341,6 +419,8 @@ async function init() {
 $('flash').onclick = () => run(true);
 $('rename').onclick = () => run(false);
 $('refresh').onclick = () => refresh();
+$('fwFile').onchange = () => chooseFirmware();
+$('fwReset').onclick = () => resetFirmware();
 init();
 </script>
 </body>

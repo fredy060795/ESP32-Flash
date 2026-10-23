@@ -20,6 +20,13 @@ als Bluetooth-Helmkamera.
 `start.bat` startet einen kleinen lokalen Server (Windows PowerShell, keine Installation nötig) und lädt beim
 Start die neueste Firmware und – nur beim ersten Mal – esptool herunter.
 
+Welche Firmware geflasht wird, steht auf der Seite unter **Firmware**:
+1. eine selbst ausgewählte `.bin`-Datei (z. B. aus dem Actions-Download), sonst
+2. die neueste Version von GitHub Pages, sonst
+3. die mitgelieferte Datei `firmware/bin/esp32cam_ble.bin` aus dem Ordner.
+
+Es muss die komplette Datei `esp32cam_ble.bin` sein (Image ab Adresse 0x0), nicht der App-Teil allein.
+
 ## Web-Flasher ohne Download
 
 **https://fredy060795.github.io/ESP32-Flash/**
