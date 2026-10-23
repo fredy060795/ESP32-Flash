@@ -1,0 +1,11 @@
+{
+  "name": "ESP32-CAM BLE",
+  "version": "1.0.0",
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP32",
+      "parts": [{ "path": "firmware/esp32cam_ble.bin", "offset": 0 }]
+    }
+  ]
+}

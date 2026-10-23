@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32-CAM Flasher</title>
+<link rel="stylesheet" href="style.css">
+<script type="module" src="https://unpkg.com/esp-web-tools@10.4.0/dist/web/install-button.js?module"></script>
+</head>
+<body>
+<main>
+  <h1>ESP32-CAM Flasher</h1>
+  <p class="lead">Firmware für die ESP32-CAM (OV2640) mit eigenem WLAN-Hotspot und Bluetooth.
+    Board anstecken, Knopf drücken, fertig – keine Software nötig.</p>
+
+  <section class="card">
+    <h2>1. Kamera flashen</h2>
+    <ol>
+      <li>Kamera auf das USB-C-Board (ESP32-CAM-MB) stecken und per USB-Kabel an den PC anschließen.</li>
+      <li>Diese Seite in <b>Chrome</b> oder <b>Edge</b> am PC öffnen.</li>
+      <li>Auf <b>Installieren</b> klicken, den Port (meist „USB-SERIAL CH340“) auswählen und bestätigen.</li>
+      <li>Nach „Installation complete“ den <b>RST</b>-Knopf an der Kamera drücken.</li>
+    </ol>
+    <div class="install">
+      <esp-web-install-button manifest="manifest.json">
+        <button slot="activate" class="btn pri">Installieren</button>
+        <span slot="unsupported" class="warn">Dieser Browser kann nicht flashen. Bitte Chrome oder Edge am PC/Mac verwenden.</span>
+        <span slot="not-allowed" class="warn">Flashen geht nur über https. Bitte die Seite über GitHub Pages öffnen.</span>
+      </esp-web-install-button>
+    </div>
+    <details>
+      <summary>Kein Port zu sehen / „Failed to connect“?</summary>
+      <ul>
+        <li>Windows braucht den <b>CH340-Treiber</b> (einmalig installieren, dann Board neu anstecken).</li>
+        <li>Ein Kabel verwenden, das Daten überträgt – reine Ladekabel funktionieren nicht.</li>
+        <li>Klappt die Verbindung nicht: <b>IO0</b>-Knopf am USB-Board gedrückt halten, kurz <b>RST</b> drücken,
+          IO0 loslassen und erneut auf Installieren klicken.</li>
+      </ul>
+    </details>
+  </section>
+
+  <section class="card">
+    <h2>2. Kamera benutzen</h2>
+    <p><b>Per Bluetooth (Handy):</b> Die <a href="app.html">Kamera-App</a> öffnen und auf „Verbinden“ tippen.
+      Dort siehst du das Live-Bild über Bluetooth, das Hotspot-Passwort und kannst WLAN, Licht und Auflösung einstellen.</p>
+    <p><b>Per WLAN (flüssiges Video):</b> Mit dem WLAN <code>ESP32-CAM-XXXX</code> verbinden
+      (Passwort ab Werk <code>kamera123</code>) und <a href="http://192.168.4.1">http://192.168.4.1</a> öffnen.</p>
+    <p class="note">Bluetooth im Browser: Android mit Chrome, PC/Mac mit Chrome oder Edge.
+      Auf dem iPhone die kostenlose App „Bluefy“ verwenden – Safari unterstützt kein Bluetooth.</p>
+  </section>
+</main>
+</body>
+</html>

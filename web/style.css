@@ -1,0 +1,57 @@
+:root {
+  color-scheme: light dark;
+  --bg: #f4f5f7;
+  --fg: #16181d;
+  --card: #ffffff;
+  --mut: #5d6470;
+  --acc: #0b6bcb;
+  --bd: #d9dce1;
+  --warn: #b3261e;
+  --ok: #1e7f3c;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111317;
+    --fg: #e8eaee;
+    --card: #1b1e24;
+    --mut: #9aa1ad;
+    --acc: #4ea1ff;
+    --bd: #2c3038;
+    --warn: #ff8a80;
+    --ok: #6fcf8a;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; background: var(--bg); color: var(--fg); }
+main { max-width: 760px; margin: 0 auto; padding: 24px 16px 48px; }
+h1 { font-size: 26px; margin: 0 0 8px; }
+h2 { font-size: 18px; margin: 0 0 12px; }
+a { color: var(--acc); }
+code { background: var(--bg); padding: 1px 6px; border-radius: 4px; }
+.lead { color: var(--mut); margin: 0 0 20px; }
+.note { color: var(--mut); font-size: 14px; }
+.card { background: var(--card); border: 1px solid var(--bd); border-radius: 12px; padding: 18px; margin-bottom: 16px; }
+.install { margin: 16px 0; }
+.warn { color: var(--warn); }
+.btn, button, select, input {
+  font: inherit; padding: 10px 14px; border-radius: 8px; border: 1px solid var(--bd);
+  background: var(--card); color: var(--fg);
+}
+.btn, button { cursor: pointer; }
+.btn.pri, button.pri { background: var(--acc); border-color: var(--acc); color: #fff; font-weight: 600; }
+button:disabled { opacity: .5; cursor: default; }
+input { width: 100%; }
+input[type=range] { padding: 0; }
+.row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
+.row > * { flex: 1 1 auto; }
+.row > button { flex: 0 0 auto; }
+label { display: block; font-size: 14px; color: var(--mut); margin-top: 10px; }
+.view { background: #000; border-radius: 10px; aspect-ratio: 4 / 3; display: flex; align-items: center; justify-content: center; overflow: hidden; color: #9aa1ad; }
+.view img { width: 100%; height: 100%; object-fit: contain; }
+.kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; font-size: 15px; }
+.kv dt { color: var(--mut); }
+.kv dd { margin: 0; word-break: break-all; }
+.badge { display: inline-block; font-size: 13px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--bd); color: var(--mut); }
+.badge.ok { color: var(--ok); border-color: var(--ok); }
+.hidden { display: none !important; }
+details summary { cursor: pointer; color: var(--acc); }
